@@ -67,10 +67,6 @@ if [ -f /var/account/acct ]; then
 	accton /var/account/acct
 fi
 
-if [ -f /etc/rc.installer_cleanup ]; then
-	/etc/rc.installer_cleanup multiuser
-fi
-
 echo "Resetting files and devices"
 
 RMRF_ITEMS="/mach.sym /var/tmp/folders.*"
@@ -229,6 +225,10 @@ if [ "${SafeBoot}" = "-x" ]; then
 else
 	echo "Configuring kernel extensions"
 	kextd
+fi
+
+if [ -f /etc/rc.installer_cleanup ]; then
+	/etc/rc.installer_cleanup multiuser
 fi
 
 if [  "${SafeBoot}" != "-x" -a -x "${BootCacheControl}" ]; then
