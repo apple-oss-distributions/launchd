@@ -171,6 +171,7 @@ static void loopback_setup(void);
 static void workaround3048875(int argc, char *argv[]);
 static void reload_launchd_config(void);
 static int dir_has_files(const char *path);
+static void testfd_or_openfd(int fd, const char *path, int flags);
 static void setup_job_env(launch_data_t obj, const char *key, void *context);
 static void unsetup_job_env(launch_data_t obj, const char *key, void *context);
 
@@ -192,20 +193,6 @@ int main(int argc, char *argv[])
 		SIGTERM, SIGURG, SIGTSTP, SIGTSTP, SIGCONT, /*SIGCHLD,*/
 		SIGTTIN, SIGTTOU, SIGIO, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF,
 		SIGWINCH, SIGINFO, SIGUSR1, SIGUSR2 };
-	void testfd_or_openfd(int fd, const char *path, int flags) {
-		int tmpfd;
-
-		if (-1 != (tmpfd = dup(fd))) {
-			close(tmpfd);
-		} else {
-			if (-1 == (tmpfd = open(path, flags))) {
-				syslog(LOG_ERR, "open(\"%s\", ...): %m", path);
-			} else if (tmpfd != fd) {
-				dup2(tmpfd, fd);
-				close(tmpfd);
-			}
-		}
-	};
 	struct kevent kev;
 	size_t i;
 	bool sflag = false, xflag = false, vflag = false, dflag = false;
@@ -333,11 +320,26 @@ static void pid1_magic_init(bool sflag, bool vflag, bool xflag)
 	int memmib[2] = { CTL_HW, HW_PHYSMEM };
 	int mvnmib[2] = { CTL_KERN, KERN_MAXVNODES };
 	int hnmib[2] = { CTL_KERN, KERN_HOSTNAME };
+	int tfp_r_mib[3] = { CTL_KERN, KERN_TFP, KERN_TFP_READ_GROUP };
+	int tfp_rw_mib[3] = { CTL_KERN, KERN_TFP, KERN_TFP_RW_GROUP };
+	gid_t tfp_r_gid = 0;
+	gid_t tfp_rw_gid = 0;
+	struct group *tfp_gr;
 	uint64_t mem = 0;
 	uint32_t mvn;
 	size_t memsz = sizeof(mem);
 	int pthr_r;
-		
+
+	if ((tfp_gr = getgrnam("procview"))) {
+		tfp_r_gid = tfp_gr->gr_gid;
+		sysctl(tfp_r_mib, 3, NULL, NULL, &tfp_r_gid, sizeof(tfp_r_gid));
+	}
+
+	if ((tfp_gr = getgrnam("procmod"))) {
+		tfp_rw_gid = tfp_gr->gr_gid;
+		sysctl(tfp_rw_mib, 3, NULL, NULL, &tfp_rw_gid, sizeof(tfp_rw_gid));
+	}
+
 	setpriority(PRIO_PROCESS, 0, -1);
 
 	if (setsid() == -1)
@@ -2398,5 +2400,21 @@ static void async_callback(void)
 		break;
 	default:
 		syslog(LOG_DEBUG, "unexpected: kevent() returned something != 0, -1 or 1");
+	}
+}
+
+static void testfd_or_openfd(int fd, const char *path, int flags)
+{
+	int tmpfd;
+
+	if (-1 != (tmpfd = dup(fd))) {
+		close(tmpfd);
+	} else {
+		if (-1 == (tmpfd = open(path, flags))) {
+			syslog(LOG_ERR, "open(\"%s\", ...): %m", path);
+		} else if (tmpfd != fd) {
+			dup2(tmpfd, fd);
+			close(tmpfd);
+		}
 	}
 }
