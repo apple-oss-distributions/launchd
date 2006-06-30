@@ -48,12 +48,10 @@ if [ "${SafeBoot}" != "-x" -a -x "${BootCacheControl}" ]; then
 	${BootCacheControl} start
 fi
 
-if [ -f /etc/sysctl-macosxserver.conf ]; then
-	awk '{ if (!index($1, "#") && index($1, "=")) print $1 }' < /etc/sysctl-macosxserver.conf | while read
-	do
-		sysctl -w ${REPLY}
-	done
+if [ -f /etc/rc.server ]; then
+	sh /etc/rc.server
 fi
+
 if [ -f /etc/sysctl.conf ]; then
 	awk '{ if (!index($1, "#") && index($1, "=")) print $1 }' < /etc/sysctl.conf | while read
 	do

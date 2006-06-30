@@ -23,10 +23,6 @@
 #include <Security/Authorization.h>
 #include <Security/AuthorizationTags.h>
 #include <Security/AuthSession.h>
-#ifdef EVFILT_MACH_IMPLEMENTED
-#include <mach/mach_error.h>
-#include <mach/port.h>
-#endif
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/event.h>
@@ -159,12 +155,6 @@ static void pid1_magic_init(bool sflag, bool vflag, bool xflag);
 static void launchd_server_init(bool create_session);
 static void conceive_firstborn(char *argv[]);
 
-#ifdef EVFILT_MACH_IMPLEMENTED
-static void *mach_demand_loop(void *);
-static void mach_callback(void *, struct kevent *);
-static kq_callback kqmach_callback = mach_callback;
-#endif
-
 static void usage(FILE *where);
 static int _fd(int fd);
 
@@ -191,6 +181,7 @@ static bool shutdown_in_progress = false;
 static pthread_t mach_server_loop_thread;
 mach_port_t launchd_bootstrap_port = MACH_PORT_NULL;
 sigset_t blocked_signals = 0;
+pthread_mutex_t giant_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *pending_stdout = NULL;
 static char *pending_stderr = NULL;
 
@@ -204,6 +195,8 @@ int main(int argc, char *argv[])
 	size_t i;
 	bool sflag = false, xflag = false, vflag = false, dflag = false;
 	int ch;
+
+	__log_liblaunch_bug = _log_launchd_bug;
 
 	if (getpid() == 1)
 		workaround3048875(argc, argv);
@@ -234,37 +227,35 @@ int main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
-	if (dflag && daemon(0, 0) == -1)
-		syslog(LOG_WARNING, "couldn't daemonize: %m");
+	if (dflag) {
+		assumes(daemon(0, 0) != -1);
+	}
 
-	if ((mainkq = kqueue()) == -1) {
-		syslog(LOG_EMERG, "kqueue(): %m");
+	if (!assumes((mainkq = kqueue()) != -1)) {
 		abort();
 	}
 
-	if ((asynckq = kqueue()) == -1) {
-		syslog(LOG_ERR, "kqueue(): %m");
+	if (!assumes((asynckq = kqueue()) != -1)) {
 		abort();
 	}
 	
-	if (kevent_mod(asynckq, EVFILT_READ, EV_ADD, 0, 0, &kqasync_callback) == -1) {
-		syslog(LOG_ERR, "kevent_mod(asynckq, EVFILT_READ): %m");
+	if (!assumes(kevent_mod(asynckq, EVFILT_READ, EV_ADD, 0, 0, &kqasync_callback) != -1)) {
 		abort();
 	}
 
 	sigemptyset(&blocked_signals);
 
 	for (i = 0; i < (sizeof(sigigns) / sizeof(int)); i++) {
-		if (kevent_mod(sigigns[i], EVFILT_SIGNAL, EV_ADD, 0, 0, &kqsignal_callback) == -1)
-			syslog(LOG_ERR, "failed to add kevent for signal: %d: %m", sigigns[i]);
+		assumes(kevent_mod(sigigns[i], EVFILT_SIGNAL, EV_ADD, 0, 0, &kqsignal_callback) != -1);
 		sigaddset(&blocked_signals, sigigns[i]);
 		signal(sigigns[i], SIG_IGN);
 	}
 
 	/* sigh... ignoring SIGCHLD has side effects: we can't call wait*() */
-	if (kevent_mod(SIGCHLD, EVFILT_SIGNAL, EV_ADD, 0, 0, &kqsignal_callback) == -1)
-		syslog(LOG_ERR, "failed to add kevent for signal: %d: %m", SIGCHLD);
+	assumes(kevent_mod(SIGCHLD, EVFILT_SIGNAL, EV_ADD, 0, 0, &kqsignal_callback) != -1);
 	
+	assumes(pthread_mutex_lock(&giant_lock) == 0);
+
 	if (getpid() == 1) {
 		pid1_magic_init(sflag, vflag, xflag);
 	} else {
@@ -273,8 +264,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* do this after pid1_magic_init() to not catch ourselves mounting stuff */
-	if (kevent_mod(0, EVFILT_FS, EV_ADD, 0, 0, &kqfs_callback) == -1)
-		syslog(LOG_ERR, "kevent_mod(EVFILT_FS, &kqfs_callback): %m");
+	assumes(kevent_mod(0, EVFILT_FS, EV_ADD, 0, 0, &kqfs_callback) != -1);
 
 
 	if (argv[0])
@@ -288,6 +278,7 @@ int main(int argc, char *argv[])
 	for (;;) {
 		static struct timespec timeout = { 30, 0 };
 		struct timespec *timeoutp = NULL;
+		int kev_r;
 
 		if (getpid() == 1) {
 			if (readcfg_pid == 0)
@@ -301,7 +292,11 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		switch (kevent(mainkq, NULL, 0, &kev, 1, timeoutp)) {
+		assumes(pthread_mutex_unlock(&giant_lock) == 0);
+		kev_r = kevent(mainkq, NULL, 0, &kev, 1, timeoutp);
+		assumes(pthread_mutex_lock(&giant_lock) == 0);
+
+		switch (kev_r) {
 		case -1:
 			syslog(LOG_DEBUG, "kevent(): %m");
 			break;
@@ -337,31 +332,26 @@ static void pid1_magic_init(bool sflag, bool vflag, bool xflag)
 	uint64_t mem = 0;
 	uint32_t mvn;
 	size_t memsz = sizeof(mem);
-	int pthr_r;
 
 #ifdef KERN_TFP
 	if ((tfp_gr = getgrnam("procview"))) {
 		tfp_r_gid = tfp_gr->gr_gid;
-		sysctl(tfp_r_mib, 3, NULL, NULL, &tfp_r_gid, sizeof(tfp_r_gid));
+		assumes(sysctl(tfp_r_mib, 3, NULL, NULL, &tfp_r_gid, sizeof(tfp_r_gid)) != -1);
 	}
 
 	if ((tfp_gr = getgrnam("procmod"))) {
 		tfp_rw_gid = tfp_gr->gr_gid;
-		sysctl(tfp_rw_mib, 3, NULL, NULL, &tfp_rw_gid, sizeof(tfp_rw_gid));
+		assumes(sysctl(tfp_rw_mib, 3, NULL, NULL, &tfp_rw_gid, sizeof(tfp_rw_gid)) != -1);
 	}
 #endif
 
 	setpriority(PRIO_PROCESS, 0, -1);
 
-	if (setsid() == -1)
-		syslog(LOG_ERR, "setsid(): %m");
+	assumes(setsid() != -1);
 
-	if (chdir("/") == -1)
-		syslog(LOG_ERR, "chdir(\"/\"): %m");
+	assumes(chdir("/") != -1);
 
-	if (sysctl(memmib, 2, &mem, &memsz, NULL, 0) == -1) {
-		syslog(LOG_WARNING, "sysctl(\"%s\"): %m", "hw.physmem");
-	} else {
+	if (assumes(sysctl(memmib, 2, &mem, &memsz, NULL, 0) != -1)) {
 		/* The following assignment of mem to itself if the size
 		 * of data returned is 32 bits instead of 64 is a clever
 		 * C trick to move the 32 bits on big endian systems to
@@ -372,33 +362,27 @@ static void pid1_magic_init(bool sflag, bool vflag, bool xflag)
 		if (memsz == 4)
 			mem = *(uint32_t *)&mem;
 		mvn = mem / (64 * 1024) + 1024;
-		if (sysctl(mvnmib, 2, NULL, NULL, &mvn, sizeof(mvn)) == -1)
-			syslog(LOG_WARNING, "sysctl(\"%s\"): %m", "kern.maxvnodes");
+		assumes(sysctl(mvnmib, 2, NULL, NULL, &mvn, sizeof(mvn)) != -1);
 	}
-	if (sysctl(hnmib, 2, NULL, NULL, "localhost", sizeof("localhost")) == -1)
-		syslog(LOG_WARNING, "sysctl(\"%s\"): %m", "kern.hostname");
+	assumes(sysctl(hnmib, 2, NULL, NULL, "localhost", sizeof("localhost")) != -1);
 
-	if (setlogin("root") == -1)
-		syslog(LOG_ERR, "setlogin(\"root\"): %m");
+	assumes(setlogin("root") != -1);
 
 	loopback_setup();
 
-	if (mount("fdesc", "/dev", MNT_UNION, NULL) == -1)
-		syslog(LOG_ERR, "mount(\"%s\", \"%s\", ...): %m", "fdesc", "/dev/");
+	assumes(mount("fdesc", "/dev", MNT_UNION, NULL) != -1);
 
 	setenv("PATH", _PATH_STDPATH, 1);
 
 	launchd_bootstrap_port = mach_init_init();
-	task_set_bootstrap_port(mach_task_self(), launchd_bootstrap_port);
+	assumes(task_set_bootstrap_port(mach_task_self(), launchd_bootstrap_port) == KERN_SUCCESS);
 	bootstrap_port = MACH_PORT_NULL;
 
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	assumes(pthread_attr_init(&attr) == 0);
+	assumes(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0);
 
-	pthr_r = pthread_create(&mach_server_loop_thread, &attr, mach_server_loop, NULL);
-	if (pthr_r != 0) {
-		syslog(LOG_ERR, "pthread_create(mach_server_loop): %s", strerror(pthr_r));
-		exit(EXIT_FAILURE);
+	if (!assumes(pthread_create(&mach_server_loop_thread, &attr, mach_server_loop, NULL) == 0)) {
+		abort();
 	}
 
 	pthread_attr_destroy(&attr);
@@ -441,10 +425,8 @@ static void launchd_clean_up(void)
 	seteuid(0);
 	setegid(0);
 
-	if (-1 == unlink(sockpath))
-		syslog(LOG_WARNING, "unlink(\"%s\"): %m", sockpath);
-	else if (-1 == rmdir(sockdir))
-		syslog(LOG_WARNING, "rmdir(\"%s\"): %m", sockdir);
+	if (assumes(unlink(sockpath) != -1))
+		assumes(rmdir(sockdir) != -1);
 
 	setegid(getgid());
 	seteuid(getuid());
@@ -507,15 +489,12 @@ static void launchd_server_init(bool create_session)
 		}
 	}
 
-	if (chown(ourdir, getuid(), getgid()) == -1)
-		syslog(LOG_WARNING, "chown(\"%s\"): %m", ourdir);
+	assumes(chown(ourdir, getuid(), getgid()) != -1);
 
 	setegid(getgid());
 	seteuid(getuid());
 
-	ourdirfd = _fd(open(ourdir, O_RDONLY));
-	if (ourdirfd == -1) {
-		syslog(LOG_ERR, "open(\"%s\"): %m", ourdir);
+	if (!assumes((ourdirfd = _fd(open(ourdir, O_RDONLY))) != -1)) {
 		goto out_bad;
 	}
 
@@ -533,8 +512,7 @@ static void launchd_server_init(bool create_session)
 			syslog(LOG_ERR, "unlink(\"thesocket\"): %m");
 		goto out_bad;
 	}
-	if ((fd = _fd(socket(AF_UNIX, SOCK_STREAM, 0))) == -1) {
-		syslog(LOG_ERR, "socket(\"thesocket\"): %m");
+	if (!assumes((fd = _fd(socket(AF_UNIX, SOCK_STREAM, 0))) != -1)) {
 		goto out_bad;
 	}
 	oldmask = umask(077);
@@ -546,13 +524,11 @@ static void launchd_server_init(bool create_session)
 		goto out_bad;
 	}
 
-	if (listen(fd, SOMAXCONN) == -1) {
-		syslog(LOG_ERR, "listen(\"thesocket\"): %m");
+	if (!assumes(listen(fd, SOMAXCONN) != -1)) {
 		goto out_bad;
 	}
 
-	if (kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, &kqlisten_callback) == -1) {
-		syslog(LOG_ERR, "kevent_mod(\"thesocket\", EVFILT_READ): %m");
+	if (!assumes(kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, &kqlisten_callback) != -1)) {
 		goto out_bad;
 	}
 
@@ -570,41 +546,54 @@ out_bad:
 
 	if (!launchd_inited) {
 		if (fd != -1)
-			close(fd);
+			assumes(close(fd) != -1);
 		if (ourdirfd != -1)
-			close(ourdirfd);
+			assumes(close(ourdirfd) != -1);
 	}
 }
 
 static long long job_get_integer(launch_data_t j, const char *key)
 {
-	launch_data_t t = launch_data_dict_lookup(j, key);
-	if (t)
+	launch_data_t t;
+
+	if (!assumes(j != NULL))
+		return -1;
+
+	if ((t = launch_data_dict_lookup(j, key))) {
 		return launch_data_get_integer(t);
-	else
+	} else {
 		return 0;
+	}
 }
 
 static const char *job_get_string(launch_data_t j, const char *key)
 {
-	launch_data_t t = launch_data_dict_lookup(j, key);
-	if (t)
-		return launch_data_get_string(t);
-	else
+	launch_data_t t;
+
+	if (!assumes(j != NULL))
 		return NULL;
+
+	if ((t = launch_data_dict_lookup(j, key))) {
+		return launch_data_get_string(t);
+	} else {
+		return NULL;
+	}
 }
 
 static const char *job_get_file2exec(launch_data_t j)
 {
-	launch_data_t tmpi, tmp = launch_data_dict_lookup(j, LAUNCH_JOBKEY_PROGRAM);
+	launch_data_t tmpi, tmp;
 
-	if (tmp) {
+	if (!assumes(j != NULL))
+		return NULL;
+
+	if ((tmp = launch_data_dict_lookup(j, LAUNCH_JOBKEY_PROGRAM))) {
 		return launch_data_get_string(tmp);
 	} else {
 		tmp = launch_data_dict_lookup(j, LAUNCH_JOBKEY_PROGRAMARGUMENTS);
-		if (tmp) {
+		if (assumes(tmp != NULL)) {
 			tmpi = launch_data_array_get_index(tmp, 0);
-			if (tmpi)
+			if (assumes(tmpi != NULL))
 				return launch_data_get_string(tmpi);
 		}
 		return NULL;
@@ -613,29 +602,37 @@ static const char *job_get_file2exec(launch_data_t j)
 
 static bool job_get_bool(launch_data_t j, const char *key)
 {
-	launch_data_t t = launch_data_dict_lookup(j, key);
-	if (t)
-		return launch_data_get_bool(t);
-	else
+	launch_data_t t;
+
+	if (!assumes(j != NULL))
 		return false;
+
+	if ((t = launch_data_dict_lookup(j, key))) {
+		return launch_data_get_bool(t);
+	} else {
+		return false;
+	}
 }
 
 static void ipc_open(int fd, struct jobcb *j)
 {
 	struct conncb *c = calloc(1, sizeof(struct conncb));
 
-	fcntl(fd, F_SETFL, O_NONBLOCK);
+	if (!assumes(c != NULL))
+		return;
+
+	assumes(fcntl(fd, F_SETFL, O_NONBLOCK) != -1);
 
 	c->kqconn_callback = ipc_callback;
 	c->conn = launchd_fdopen(fd);
 	c->j = j;
 	TAILQ_INSERT_TAIL(&connections, c, tqe);
-	kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, &c->kqconn_callback);
+	assumes(kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, &c->kqconn_callback) != -1);
 }
 
 static void simple_zombie_reaper(void *obj __attribute__((unused)), struct kevent *kev)
 {
-	waitpid(kev->ident, NULL, 0);
+	assumes(waitpid(kev->ident, NULL, 0) != -1);
 }
 
 static void listen_callback(void *obj __attribute__((unused)), struct kevent *kev)
@@ -644,11 +641,9 @@ static void listen_callback(void *obj __attribute__((unused)), struct kevent *ke
 	socklen_t sl = sizeof(sun);
 	int cfd;
 
-	if ((cfd = _fd(accept(kev->ident, (struct sockaddr *)&sun, &sl))) == -1) {
-		return;
+	if (assumes((cfd = _fd(accept(kev->ident, (struct sockaddr *)&sun, &sl))) != -1)) {
+		ipc_open(cfd, NULL);
 	}
-
-	ipc_open(cfd, NULL);
 }
 
 static void ipc_callback(void *obj, struct kevent *kev)
@@ -670,7 +665,7 @@ static void ipc_callback(void *obj, struct kevent *kev)
 				ipc_close(c);
 			}
 		} else if (r == 0) {
-			kevent_mod(launchd_getfd(c->conn), EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+			assumes(kevent_mod(launchd_getfd(c->conn), EVFILT_WRITE, EV_DELETE, 0, 0, NULL) != -1);
 		}
 	} else {
 		syslog(LOG_DEBUG, "%s(): unknown filter type!", __func__);
@@ -697,7 +692,7 @@ static void launch_data_close_fds(launch_data_t o)
 		break;
 	case LAUNCH_DATA_FD:
 		if (launch_data_get_fd(o) != -1)
-			close(launch_data_get_fd(o));
+			assumes(close(launch_data_get_fd(o)) != -1);
 		break;
 	default:
 		break;
@@ -742,7 +737,7 @@ static void job_ignore_fds(launch_data_t o, const char *key __attribute__((unuse
 		fd = launch_data_get_fd(o);
 		if (-1 != fd) {
 			job_log(j, LOG_DEBUG, "Ignoring FD: %d", fd);
-			kevent_mod(fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+			assumes(kevent_mod(fd, EVFILT_READ, EV_DELETE, 0, 0, NULL) != -1);
 		}
 		break;
 	default:
@@ -759,10 +754,10 @@ static void job_ignore(struct jobcb *j)
 		job_ignore_fds(j_sockets, NULL, j);
 
 	for (i = 0; i < j->vnodes_cnt; i++) {
-		kevent_mod(j->vnodes[i], EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
+		assumes(kevent_mod(j->vnodes[i], EVFILT_VNODE, EV_DELETE, 0, 0, NULL) != -1);
 	}
 	for (i = 0; i < j->qdirs_cnt; i++) {
-		kevent_mod(j->qdirs[i], EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
+		assumes(kevent_mod(j->qdirs[i], EVFILT_VNODE, EV_DELETE, 0, 0, NULL) != -1);
 	}
 }
 
@@ -784,7 +779,7 @@ static void job_watch_fds(launch_data_t o, const char *key __attribute__((unused
 		fd = launch_data_get_fd(o);
 		if (-1 != fd) {
 			job_log(j, LOG_DEBUG, "Watching FD: %d", fd);
-			kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, cookie);
+			assumes(kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, cookie) != -1);
 		}
 		break;
 	default:
@@ -810,14 +805,14 @@ static void job_watch(struct jobcb *j)
 			if (-1 == (j->vnodes[i] = _fd(open(thepath, O_EVTONLY))))
 				job_log_error(j, LOG_ERR, "open(\"%s\", O_EVTONLY)", thepath);
 		}
-		kevent_mod(j->vnodes[i], EVFILT_VNODE, EV_ADD|EV_CLEAR,
+		assumes(kevent_mod(j->vnodes[i], EVFILT_VNODE, EV_ADD|EV_CLEAR,
 				NOTE_WRITE|NOTE_EXTEND|NOTE_DELETE|NOTE_RENAME|NOTE_REVOKE|NOTE_ATTRIB|NOTE_LINK,
-				0, &j->kqjob_callback);
+				0, &j->kqjob_callback) != -1);
 	}
 
 	for (i = 0; i < j->qdirs_cnt; i++) {
-		kevent_mod(j->qdirs[i], EVFILT_VNODE, EV_ADD|EV_CLEAR,
-				NOTE_WRITE|NOTE_EXTEND|NOTE_ATTRIB|NOTE_LINK, 0, &j->kqjob_callback);
+		assumes(kevent_mod(j->qdirs[i], EVFILT_VNODE, EV_ADD|EV_CLEAR,
+				NOTE_WRITE|NOTE_EXTEND|NOTE_ATTRIB|NOTE_LINK, 0, &j->kqjob_callback) != -1);
 	}
 
 	for (i = 0; i < j->qdirs_cnt; i++) {
@@ -837,7 +832,7 @@ static void job_watch(struct jobcb *j)
 static void job_stop(struct jobcb *j)
 {
 	if (j->p)
-		kill(j->p, SIGTERM);
+		assumes(kill(j->p, SIGTERM) != -1);
 }
 
 static void job_remove(struct jobcb *j)
@@ -872,9 +867,9 @@ static void job_remove(struct jobcb *j)
 	if (j->qdirs)
 		free(j->qdirs);
 	if (j->start_interval)
-		kevent_mod((uintptr_t)&j->start_interval, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+		assumes(kevent_mod((uintptr_t)&j->start_interval, EVFILT_TIMER, EV_DELETE, 0, 0, NULL) != -1);
 	if (j->start_cal_interval) {
-		kevent_mod((uintptr_t)j->start_cal_interval, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+		assumes(kevent_mod((uintptr_t)j->start_cal_interval, EVFILT_TIMER, EV_DELETE, 0, 0, NULL) != -1);
 		free(j->start_cal_interval);
 	}
 	kevent_mod((uintptr_t)j, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
@@ -905,7 +900,7 @@ static void ipc_readmsg(launch_data_t msg, void *context)
 
 	if (launchd_msg_send(rmc.c->conn, rmc.resp) == -1) {
 		if (errno == EAGAIN) {
-			kevent_mod(launchd_getfd(rmc.c->conn), EVFILT_WRITE, EV_ADD, 0, 0, &rmc.c->kqconn_callback);
+			assumes(kevent_mod(launchd_getfd(rmc.c->conn), EVFILT_WRITE, EV_ADD, 0, 0, &rmc.c->kqconn_callback) != -1);
 		} else {
 			syslog(LOG_DEBUG, "launchd_msg_send() == -1: %m");
 			ipc_close(rmc.c);
@@ -1002,10 +997,11 @@ static void ipc_readmsg2(launch_data_t data, const char *cmd, void *context)
 		resp = launch_data_new_errno(0);
 	} else if (!strcmp(cmd, LAUNCH_KEY_CHECKIN)) {
 		if (rmc->c->j) {
-			resp = launch_data_copy(rmc->c->j->ldj);
-			if (NULL == launch_data_dict_lookup(resp, LAUNCH_JOBKEY_TIMEOUT)) {
-				launch_data_t to = launch_data_new_integer(LAUNCHD_MIN_JOB_RUN_TIME);
-				launch_data_dict_insert(resp, to, LAUNCH_JOBKEY_TIMEOUT);
+			if (assumes((resp = launch_data_copy(rmc->c->j->ldj)) != NULL)) {
+				if (NULL == launch_data_dict_lookup(resp, LAUNCH_JOBKEY_TIMEOUT)) {
+					launch_data_t to = launch_data_new_integer(LAUNCHD_MIN_JOB_RUN_TIME);
+					launch_data_dict_insert(resp, to, LAUNCH_JOBKEY_TIMEOUT);
+				}
 			}
 			rmc->c->j->checkedin = true;
 		} else {
@@ -1043,11 +1039,11 @@ static void ipc_readmsg2(launch_data_t data, const char *cmd, void *context)
 		umask(oldmask);
 	} else if (!strcmp(cmd, LAUNCH_KEY_GETRUSAGESELF)) {
 		struct rusage rusage;
-		getrusage(RUSAGE_SELF, &rusage);
+		assumes(getrusage(RUSAGE_SELF, &rusage) != -1);
 		resp = launch_data_new_opaque(&rusage, sizeof(rusage));
 	} else if (!strcmp(cmd, LAUNCH_KEY_GETRUSAGECHILDREN)) {
 		struct rusage rusage;
-		getrusage(RUSAGE_CHILDREN, &rusage);
+		assumes(getrusage(RUSAGE_CHILDREN, &rusage) != -1);
 		resp = launch_data_new_opaque(&rusage, sizeof(rusage));
 	} else if (!strcmp(cmd, LAUNCH_KEY_SETSTDOUT)) {
 		resp = setstdio(STDOUT_FILENO, data);
@@ -1076,7 +1072,7 @@ static launch_data_t setstdio(int d, launch_data_t o)
 			free(*where);
 		*where = strdup(launch_data_get_string(o));
 	} else if (launch_data_get_type(o) == LAUNCH_DATA_FD) {
-		dup2(launch_data_get_fd(o), d);
+		assumes(dup2(launch_data_get_fd(o), d) != -1);
 	} else {
 		launch_data_set_errno(resp, EINVAL);
 	}
@@ -1090,10 +1086,10 @@ static void batch_job_enable(bool e, struct conncb *c)
 		batch_disabler_count--;
 		c->disabled_batch = 0;
 		if (batch_disabler_count == 0)
-			kevent_mod(asynckq, EVFILT_READ, EV_ENABLE, 0, 0, &kqasync_callback);
+			assumes(kevent_mod(asynckq, EVFILT_READ, EV_ENABLE, 0, 0, &kqasync_callback) != -1);
 	} else if (!e && !c->disabled_batch) {
 		if (batch_disabler_count == 0)
-			kevent_mod(asynckq, EVFILT_READ, EV_DISABLE, 0, 0, &kqasync_callback);
+			assumes(kevent_mod(asynckq, EVFILT_READ, EV_DISABLE, 0, 0, &kqasync_callback) != -1);
 		batch_disabler_count++;
 		c->disabled_batch = 1;
 	}
@@ -1168,10 +1164,11 @@ static launch_data_t load_job(launch_data_t pload)
 	if ((tmp = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_STARTINTERVAL))) {
 		j->start_interval = launch_data_get_integer(tmp);
 
-		if (j->start_interval == 0)
+		if (j->start_interval == 0) {
 			job_log(j, LOG_WARNING, "StartInterval is zero, ignoring");
-		else if (-1 == kevent_mod((uintptr_t)&j->start_interval, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, j->start_interval, &j->kqjob_callback))
-			job_log_error(j, LOG_ERR, "adding kevent timer");
+		} else {
+			assumes(kevent_mod((uintptr_t)&j->start_interval, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, j->start_interval, j) != -1);
+		}
 	}
 
 	if ((tmp = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_STARTCALENDARINTERVAL))) {
@@ -1209,8 +1206,7 @@ static launch_data_t load_job(launch_data_t pload)
 		for (i = 0; i < j->vnodes_cnt; i++) {
 			const char *thepath = launch_data_get_string(launch_data_array_get_index(tmp, i));
 
-			if (-1 == (j->vnodes[i] = _fd(open(thepath, O_EVTONLY))))
-				job_log_error(j, LOG_ERR, "open(\"%s\", O_EVTONLY)", thepath);
+			assumes((j->vnodes[i] = _fd(open(thepath, O_EVTONLY))) != -1);
 		}
 
 	}
@@ -1263,115 +1259,31 @@ static void usage(FILE *where)
 		exit(EXIT_SUCCESS);
 }
 
-#ifdef EVFILT_MACH_IMPLEMENTED
-static void **machcbtable = NULL;
-static size_t machcbtable_cnt = 0;
-static int machcbreadfd = -1;
-static int machcbwritefd = -1;
-static mach_port_t mach_demand_port_set = MACH_PORT_NULL;
-static pthread_t mach_demand_thread;
-
-static void mach_callback(void *obj __attribute__((unused)), struct kevent *kev __attribute__((unused)))
-{
-	struct kevent mkev;
-	mach_port_t mp;
-
-	read(machcbreadfd, &mp, sizeof(mp));
-
-	EV_SET(&mkev, mp, EVFILT_MACHPORT, 0, 0, 0, machcbtable[MACH_PORT_INDEX(mp)]);
-
-	(*((kq_callback *)mkev.udata))(mkev.udata, &mkev);
-}
-#endif
-
 int kevent_mod(uintptr_t ident, short filter, u_short flags, u_int fflags, intptr_t data, void *udata)
 {
 	struct kevent kev;
 	int q = mainkq;
-#ifdef EVFILT_MACH_IMPLEMENTED
-	kern_return_t kr;
-	pthread_attr_t attr;
-	int pthr_r, pfds[2];
-#endif
 
 	if (EVFILT_TIMER == filter || EVFILT_VNODE == filter)
 		q = asynckq;
 
-	if (flags & EV_ADD && NULL == udata) {
-		syslog(LOG_ERR, "%s(): kev.udata == NULL!!!", __func__);
-		syslog(LOG_ERR, "kev: ident %d filter %d flags 0x%x fflags 0x%x",
-				ident, filter, flags, fflags);
+	if (flags & EV_ADD && !assumes(udata != NULL)) {
 		errno = EINVAL;
 		return -1;
 	}
 
-#ifdef EVFILT_MACH_IMPLEMENTED
-	if (filter != EVFILT_MACHPORT) {
-#endif
 #ifdef PID1_REAP_ADOPTED_CHILDREN
-		if (filter == EVFILT_PROC && getpid() == 1)
-			return 0;
+	if (filter == EVFILT_PROC && getpid() == 1)
+		return 0;
 #endif
-		EV_SET(&kev, ident, filter, flags, fflags, data, udata);
-		return kevent(q, &kev, 1, NULL, 0, NULL);
-#ifdef EVFILT_MACH_IMPLEMENTED
-	}
-
-	if (machcbtable == NULL) {
-		pthread_attr_init(&attr);
-		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-		pthr_r = pthread_create(&mach_demand_thread, &attr, mach_demand_loop, NULL);
-		if (pthr_r != 0) {
-			syslog(LOG_ERR, "pthread_create(mach_demand_loop): %s", strerror(pthr_r));
-			exit(EXIT_FAILURE);
-		}
-
-		pthread_attr_destroy(&attr);
-
-		machcbtable = malloc(0);
-		pipe(pfds);
-		machcbwritefd = _fd(pfds[1]);
-		machcbreadfd = _fd(pfds[0]);
-		kevent_mod(machcbreadfd, EVFILT_READ, EV_ADD, 0, 0, &kqmach_callback);
-		kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &mach_demand_port_set);
-		if (kr != KERN_SUCCESS) {
-			syslog(LOG_ERR, "mach_port_allocate(demand_port_set): %s", mach_error_string(kr));
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	if (flags & EV_ADD) {
-		kr = mach_port_move_member(mach_task_self(), ident, mach_demand_port_set);
-		if (kr != KERN_SUCCESS) {
-			syslog(LOG_ERR, "mach_port_move_member(): %s", mach_error_string(kr));
-			exit(EXIT_FAILURE);
-		}
-
-		if (MACH_PORT_INDEX(ident) > machcbtable_cnt)
-			machcbtable = realloc(machcbtable, MACH_PORT_INDEX(ident) * sizeof(void *));
-
-		machcbtable[MACH_PORT_INDEX(ident)] = udata;
-	} else if (flags & EV_DELETE) {
-		kr = mach_port_move_member(mach_task_self(), ident, MACH_PORT_NULL);
-		if (kr != KERN_SUCCESS) {
-			syslog(LOG_ERR, "mach_port_move_member(): %s", mach_error_string(kr));
-			exit(EXIT_FAILURE);
-		}
-	} else {
-		syslog(LOG_DEBUG, "kevent_mod(EVFILT_MACHPORT) with flags: %d", flags);
-		errno = EINVAL;
-		return -1;
-	}
-
-	return 0;
-#endif
+	EV_SET(&kev, ident, filter, flags, fflags, data, udata);
+	return kevent(q, &kev, 1, NULL, 0, NULL);
 }
 
 static int _fd(int fd)
 {
 	if (fd >= 0)
-		fcntl(fd, F_SETFD, 1);
+		assumes(fcntl(fd, F_SETFD, 1) != -1);
 	return fd;
 }
 
@@ -1406,7 +1318,7 @@ static void job_reap(struct jobcb *j)
 	job_log(j, LOG_DEBUG, "Reaping");
 
 	if (j->execfd) {
-		close(j->execfd);
+		assumes(close(j->execfd) != -1);
 		j->execfd = 0;
 	}
 
@@ -1415,8 +1327,7 @@ static void job_reap(struct jobcb *j)
 		status = pid1_child_exit_status;
 	else
 #endif
-	if (-1 == waitpid(j->p, &status, 0)) {
-		job_log_error(j, LOG_ERR, "waitpid(%d, ...)", j->p);
+	if (!assumes(waitpid(j->p, &status, 0) != -1)) {
 		return;
 	}
 
@@ -1506,10 +1417,8 @@ static void job_callback(void *obj, struct kevent *kev)
 		if (startnow && j->throttle) {
 			j->throttle = false;
 			job_log(j, LOG_WARNING, "will restart in %d seconds", LAUNCHD_MIN_JOB_RUN_TIME);
-			if (-1 == kevent_mod((uintptr_t)j, EVFILT_TIMER, EV_ADD|EV_ONESHOT,
-						NOTE_SECONDS, LAUNCHD_MIN_JOB_RUN_TIME, &j->kqjob_callback)) {
-				job_log_error(j, LOG_WARNING, "failed to setup timer callback!, starting now!");
-			} else {
+			if (assumes(kevent_mod((uintptr_t)j, EVFILT_TIMER, EV_ADD|EV_ONESHOT,
+						NOTE_SECONDS, LAUNCHD_MIN_JOB_RUN_TIME, &j->kqjob_callback) != -1)) {
 				startnow = false;
 			}
 		}
@@ -1529,7 +1438,7 @@ static void job_callback(void *obj, struct kevent *kev)
 
 				if ((NOTE_DELETE|NOTE_RENAME|NOTE_REVOKE) & kev->fflags) {
 					job_log(j, LOG_DEBUG, "watch path invalidated: %s", thepath);
-					close(j->vnodes[i]);
+					assumes(close(j->vnodes[i]) != -1);
 					j->vnodes[i] = -1; /* this will get fixed in job_watch() */
 				}
 			}
@@ -1557,14 +1466,14 @@ static void job_callback(void *obj, struct kevent *kev)
 		if (kev->data > 0) {
 			int e;
 
-			read(j->execfd, &e, sizeof(e));
+			assumes(read(j->execfd, &e, sizeof(e)) != -1);
 			errno = e;
 			job_log_error(j, LOG_ERR, "execve()");
 			job_remove(j);
 			j = NULL;
 			startnow = false;
 		} else {
-			close(j->execfd);
+			assumes(close(j->execfd) != -1);
 			j->execfd = 0;
 		}
 		startnow = false;
@@ -1599,32 +1508,32 @@ static void job_start(struct jobcb *j)
 
 	sipc = job_get_bool(j->ldj, LAUNCH_JOBKEY_SERVICEIPC);
 
-	if (job_get_bool(j->ldj, LAUNCH_JOBKEY_INETDCOMPATIBILITY))
+	if (launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_INETDCOMPATIBILITY))
 		sipc = true;
 
 	if (sipc)
-		socketpair(AF_UNIX, SOCK_STREAM, 0, spair);
+		assumes(socketpair(AF_UNIX, SOCK_STREAM, 0, spair) != -1);
 
-	socketpair(AF_UNIX, SOCK_STREAM, 0, execspair);
+	assumes(socketpair(AF_UNIX, SOCK_STREAM, 0, execspair) != -1);
 
 	time(&j->start_time);
 
 	switch (c = fork_with_bootstrap_port(launchd_bootstrap_port)) {
 	case -1:
 		job_log_error(j, LOG_ERR, "fork() failed, will try again in one second");
-		close(execspair[0]);
-		close(execspair[1]);
+		assumes(close(execspair[0]) != -1);
+		assumes(close(execspair[1]) != -1);;
 		if (sipc) {
-			close(spair[0]);
-			close(spair[1]);
+			assumes(close(spair[0]) != -1);
+			assumes(close(spair[1]) != -1);
 		}
 		if (job_get_bool(j->ldj, LAUNCH_JOBKEY_ONDEMAND))
 			job_ignore(j);
 		break;
 	case 0:
-		close(execspair[0]);
+		assumes(close(execspair[0]) != -1);
 		/* wait for our parent to say they've attached a kevent to us */
-		read(_fd(execspair[1]), &c, sizeof(c));
+		assumes(read(_fd(execspair[1]), &c, sizeof(c)) != -1);
 		if (j->firstborn) {
 			setpgid(getpid(), getpid());
 			if (isatty(STDIN_FILENO)) {
@@ -1634,33 +1543,32 @@ static void job_start(struct jobcb *j)
 		}
 
 		if (sipc) {
-			close(spair[0]);
+			assumes(close(spair[0]) != -1);
 			sprintf(nbuf, "%d", spair[1]);
 			setenv(LAUNCHD_TRUSTED_FD_ENV, nbuf, 1);
 		}
 		job_start_child(j, execspair[1]);
 		break;
 	default:
-		close(execspair[1]);
+		assumes(close(execspair[1]) != -1);
 		j->execfd = _fd(execspair[0]);
 		if (sipc) {
-			close(spair[1]);
+			assumes(close(spair[1]) != -1);
 			ipc_open(_fd(spair[0]), j);
 		}
-		if (kevent_mod(j->execfd, EVFILT_READ, EV_ADD, 0, 0, &j->kqjob_callback) == -1)
-			job_log_error(j, LOG_ERR, "kevent_mod(j->execfd): %m");
-		if (kevent_mod(c, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, &j->kqjob_callback) == -1) {
-			job_log_error(j, LOG_ERR, "kevent()");
-			job_reap(j);
-		} else {
+		assumes(kevent_mod(j->execfd, EVFILT_READ, EV_ADD, 0, 0, j) != -1);
+
+		if (assumes(kevent_mod(c, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, j) != -1)) {
 			j->p = c;
 			total_children++;
 			if (job_get_bool(j->ldj, LAUNCH_JOBKEY_ONDEMAND))
 				job_ignore(j);
+		} else {
+			job_reap(j);
 		}
 		/* this unblocks the child and avoids a race
 		 * between the above fork() and the kevent_mod() */
-		write(j->execfd, &c, sizeof(c));
+		assumes(write(j->execfd, &c, sizeof(c)) != -1);
 		break;
 	}
 }
@@ -1668,7 +1576,7 @@ static void job_start(struct jobcb *j)
 static void job_start_child(struct jobcb *j, int execfd)
 {
 	launch_data_t ldpa = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_PROGRAMARGUMENTS);
-	bool inetcompat = job_get_bool(j->ldj, LAUNCH_JOBKEY_INETDCOMPATIBILITY);
+	bool inetcompat = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_INETDCOMPATIBILITY) ? true : false;
 	size_t i, argv_cnt;
 	const char **argv, *file2exec = "/usr/libexec/launchproxy";
 	int r;
@@ -1705,17 +1613,17 @@ static void job_start_child(struct jobcb *j, int execfd)
 	}
 
 	if (-1 == r) {
-		write(execfd, &errno, sizeof(errno));
+		assumes(write(execfd, &errno, sizeof(errno)) != -1);
 		job_log_error(j, LOG_ERR, "execv%s(\"%s\", ...)", hasprog ? "" : "p", file2exec);
 	}
-	exit(EXIT_FAILURE);
+	_exit(EXIT_FAILURE);
 }
 
 static void job_setup_attributes(struct jobcb *j)
 {
 	launch_data_t srl = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_SOFTRESOURCELIMITS);
 	launch_data_t hrl = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_HARDRESOURCELIMITS);
-	bool inetcompat = job_get_bool(j->ldj, LAUNCH_JOBKEY_INETDCOMPATIBILITY);
+	bool inetcompat = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_INETDCOMPATIBILITY) ? true : false;
 	launch_data_t tmp;
 	size_t i;
 	const char *tmpstr;
@@ -1742,8 +1650,7 @@ static void job_setup_attributes(struct jobcb *j)
 		for (i = 0; i < (sizeof(limits) / sizeof(limits[0])); i++) {
 			struct rlimit rl;
 
-			if (getrlimit(limits[i].val, &rl) == -1) {
-				job_log_error(j, LOG_WARNING, "getrlimit()");
+			if (!assumes(getrlimit(limits[i].val, &rl) != -1)) {
 				continue;
 			}
 
@@ -1752,8 +1659,7 @@ static void job_setup_attributes(struct jobcb *j)
 			if (srl)
 				rl.rlim_cur = job_get_integer(srl, limits[i].key);
 
-			if (setrlimit(limits[i].val, &rl) == -1)
-				job_log_error(j, LOG_WARNING, "setrlimit()");
+			assumes(setrlimit(limits[i].val, &rl) != -1);
 		}
 	}
 
@@ -1764,12 +1670,11 @@ static void job_setup_attributes(struct jobcb *j)
 		int lowprimib[] = { CTL_KERN, KERN_PROC_LOW_PRI_IO };
 		int val = 1;
 
-		if (sysctl(lowprimib, sizeof(lowprimib) / sizeof(lowprimib[0]), NULL, NULL,  &val, sizeof(val)) == -1)
-			job_log_error(j, LOG_WARNING, "sysctl(\"%s\")", "kern.proc_low_pri_io");
+		assumes(sysctl(lowprimib, sizeof(lowprimib) / sizeof(lowprimib[0]), NULL, NULL,  &val, sizeof(val)) != -1);
 	}
 	if ((tmpstr = job_get_string(j->ldj, LAUNCH_JOBKEY_ROOTDIRECTORY))) {
-		chroot(tmpstr);
-		chdir(".");
+		assumes(chroot(tmpstr) != -1);
+		assumes(chdir(".") != -1);
 	}
 	if ((tmpstr = job_get_string(j->ldj, LAUNCH_JOBKEY_GROUPNAME))) {
 		gre = getgrnam(tmpstr);
@@ -1816,31 +1721,27 @@ static void job_setup_attributes(struct jobcb *j)
 		}
 	}
 	if ((tmpstr = job_get_string(j->ldj, LAUNCH_JOBKEY_WORKINGDIRECTORY)))
-		chdir(tmpstr);
+		assumes(chdir(tmpstr) != -1);
 	if (launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_UMASK))
 		umask(job_get_integer(j->ldj, LAUNCH_JOBKEY_UMASK));
 	if ((tmpstr = job_get_string(j->ldj, LAUNCH_JOBKEY_STANDARDOUTPATH))) {
 		int sofd = open(tmpstr, O_WRONLY|O_APPEND|O_CREAT, DEFFILEMODE);
-		if (sofd == -1) {
-			job_log_error(j, LOG_WARNING, "open(\"%s\", ...)", tmpstr);
-		} else {
-			dup2(sofd, STDOUT_FILENO);
-			close(sofd);
+		if (assumes(sofd != -1)) {
+			assumes(dup2(sofd, STDOUT_FILENO) != -1);
+			assumes(close(sofd) != -1);
 		}
 	}
 	if ((tmpstr = job_get_string(j->ldj, LAUNCH_JOBKEY_STANDARDERRORPATH))) {
 		int sefd = open(tmpstr, O_WRONLY|O_APPEND|O_CREAT, DEFFILEMODE);
-		if (sefd == -1) {
-			job_log_error(j, LOG_WARNING, "open(\"%s\", ...)", tmpstr);
-		} else {
-			dup2(sefd, STDERR_FILENO);
-			close(sefd);
+		if (assumes(sefd != -1)) {
+			assumes(dup2(sefd, STDERR_FILENO) != -1);
+			assumes(close(sefd) != -1);
 		}
 	}
 	if ((tmp = launch_data_dict_lookup(j->ldj, LAUNCH_JOBKEY_ENVIRONMENTVARIABLES)))
 		launch_data_dict_iterate(tmp, setup_job_env, NULL);
 
-	setsid();
+	assumes(setsid() != -1);
 }
 
 #ifdef PID1_REAP_ADOPTED_CHILDREN
@@ -1862,7 +1763,7 @@ static void do_shutdown(void)
 
 	shutdown_in_progress = true;
 
-	kevent_mod(asynckq, EVFILT_READ, EV_DISABLE, 0, 0, &kqasync_callback);
+	assumes(kevent_mod(asynckq, EVFILT_READ, EV_DISABLE, 0, 0, &kqasync_callback) != -1);
 
 	TAILQ_FOREACH(j, &jobs, tqe)
 		job_stop(j);
@@ -1905,8 +1806,8 @@ static void fs_callback(void)
 	if (pending_stdout) {
 		int fd = open(pending_stdout, O_CREAT|O_APPEND|O_WRONLY, DEFFILEMODE);
 		if (fd != -1) {
-			dup2(fd, STDOUT_FILENO);
-			close(fd);
+			assumes(dup2(fd, STDOUT_FILENO) != -1);
+			assumes(close(fd) != -1);
 			free(pending_stdout);
 			pending_stdout = NULL;
 		}
@@ -1914,8 +1815,8 @@ static void fs_callback(void)
 	if (pending_stderr) {
 		int fd = open(pending_stderr, O_CREAT|O_APPEND|O_WRONLY, DEFFILEMODE);
 		if (fd != -1) {
-			dup2(fd, STDERR_FILENO);
-			close(fd);
+			assumes(dup2(fd, STDERR_FILENO) != -1);
+			assumes(close(fd) != -1);
 			free(pending_stderr);
 			pending_stderr = NULL;
 		}
@@ -1925,7 +1826,7 @@ static void fs_callback(void)
 		int r = mount("volfs", VOLFSDIR, MNT_RDONLY, NULL);
 
 		if (-1 == r && errno == ENOENT) {
-			mkdir(VOLFSDIR, ACCESSPERMS & ~(S_IWUSR|S_IWGRP|S_IWOTH));
+			assumes(mkdir(VOLFSDIR, ACCESSPERMS & ~(S_IWUSR|S_IWGRP|S_IWOTH)) != -1);
 			r = mount("volfs", VOLFSDIR, MNT_RDONLY, NULL);
 		}
 
@@ -1966,80 +1867,6 @@ static void readcfg_callback(void *obj __attribute__((unused)), struct kevent *k
 	}
 }
 
-#ifdef EVFILT_MACH_IMPLEMENTED
-static void *mach_demand_loop(void *arg __attribute__((unused)))
-{
-	mach_msg_empty_rcv_t dummy;
-	kern_return_t kr;
-	mach_port_name_array_t members;
-	mach_msg_type_number_t membersCnt;
-	mach_port_status_t status;
-	mach_msg_type_number_t statusCnt;
-	unsigned int i;
-
-	for (;;) {
-
-		/*
-		 * Receive indication of message on demand service
-		 * ports without actually receiving the message (we'll
-		 * let the actual server do that.
-		 */
-		kr = mach_msg(&dummy.header, MACH_RCV_MSG|MACH_RCV_LARGE,
-				0, 0, mach_demand_port_set, 0, MACH_PORT_NULL);
-		if (kr != MACH_RCV_TOO_LARGE) {
-			syslog(LOG_WARNING, "%s(): mach_msg(): %s", __func__, mach_error_string(kr));
-			continue;
-		}
-
-		/*
-		 * Some port(s) now have messages on them, find out
-		 * which ones (there is no indication of which port
-		 * triggered in the MACH_RCV_TOO_LARGE indication).
-		 */
-		kr = mach_port_get_set_status(mach_task_self(),
-				mach_demand_port_set, &members, &membersCnt);
-		if (kr != KERN_SUCCESS) {
-			syslog(LOG_WARNING, "%s(): mach_port_get_set_status(): %s", __func__, mach_error_string(kr));
-			continue;
-		}
-
-		for (i = 0; i < membersCnt; i++) {
-			statusCnt = MACH_PORT_RECEIVE_STATUS_COUNT;
-			kr = mach_port_get_attributes(mach_task_self(), members[i],
-					MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&status, &statusCnt);
-			if (kr != KERN_SUCCESS) {
-				syslog(LOG_WARNING, "%s(): mach_port_get_attributes(): %s", __func__, mach_error_string(kr));
-				continue;
-			}
-
-			/*
-			 * For each port with messages, take it out of the
-			 * demand service portset, and inform the main thread
-			 * that it might have to start the server responsible
-			 * for it.
-			 */
-			if (status.mps_msgcount) {
-				kr = mach_port_move_member(mach_task_self(), members[i], MACH_PORT_NULL);
-				if (kr != KERN_SUCCESS) {
-					syslog(LOG_WARNING, "%s(): mach_port_move_member(): %s", __func__, mach_error_string(kr));
-					continue;
-				}
-				write(machcbwritefd, &(members[i]), sizeof(members[i]));
-			}
-		}
-
-		kr = vm_deallocate(mach_task_self(), (vm_address_t) members,
-				(vm_size_t) membersCnt * sizeof(mach_port_name_t));
-		if (kr != KERN_SUCCESS) {
-			syslog(LOG_WARNING, "%s(): vm_deallocate(): %s", __func__, mach_error_string(kr));
-			continue;
-		}
-	}
-
-	return NULL;
-}
-#endif
-
 static void reload_launchd_config(void)
 {
 	struct stat sb;
@@ -2054,11 +1881,11 @@ static void reload_launchd_config(void)
 
 	if (lstat(ldconf, &sb) == 0) {
 		int spair[2];
-		socketpair(AF_UNIX, SOCK_STREAM, 0, spair);
+		assumes(socketpair(AF_UNIX, SOCK_STREAM, 0, spair) != -1);
 		readcfg_pid = fork_with_bootstrap_port(launchd_bootstrap_port);
 		if (readcfg_pid == 0) {
 			char nbuf[100];
-			close(spair[0]);
+			assumes(close(spair[0]) != -1);
 			sprintf(nbuf, "%d", spair[1]);
 			setenv(LAUNCHD_TRUSTED_FD_ENV, nbuf, 1);
 			int fd = open(ldconf, O_RDONLY);
@@ -2066,21 +1893,19 @@ static void reload_launchd_config(void)
 				syslog(LOG_ERR, "open(\"%s\"): %m", ldconf);
 				exit(EXIT_FAILURE);
 			}
-			dup2(fd, STDIN_FILENO);
-			close(fd);
-			execl(LAUNCHCTL_PATH, LAUNCHCTL_PATH, NULL);
-			syslog(LOG_ERR, "execl(\"%s\", ...): %m", LAUNCHCTL_PATH);
-			exit(EXIT_FAILURE);
+			assumes(dup2(fd, STDIN_FILENO) != -1);
+			assumes(close(fd) != -1);
+			assumes(execl(LAUNCHCTL_PATH, LAUNCHCTL_PATH, NULL) != -1);
+			_exit(EXIT_FAILURE);
 		} else if (readcfg_pid == -1) {
-			close(spair[0]);
-			close(spair[1]);
+			assumes(close(spair[0]) != -1);
+			assumes(close(spair[1]) != -1);
 			syslog(LOG_ERR, "fork(): %m");
 			readcfg_pid = 0;
 		} else {
-			close(spair[1]);
+			assumes(close(spair[1]) != -1);
 			ipc_open(_fd(spair[0]), NULL);
-			if (kevent_mod(readcfg_pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, &kqreadcfg_callback) == -1)
-				syslog(LOG_ERR, "kevent_mod(EVFILT_PROC, &kqreadcfg_callback): %m");
+			assumes(kevent_mod(readcfg_pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, &kqreadcfg_callback) != -1);
 		}
 	}
 }
@@ -2116,18 +1941,15 @@ static void loopback_setup(void)
 	memset(&ifr, 0, sizeof(ifr));
 	strcpy(ifr.ifr_name, "lo0");
 
-	if (-1 == (s = socket(AF_INET, SOCK_DGRAM, 0)))
-		syslog(LOG_ERR, "%s: socket(%s, ...): %m", __PRETTY_FUNCTION__, "AF_INET");
-	if (-1 == (s6 = socket(AF_INET6, SOCK_DGRAM, 0)))
-		syslog(LOG_ERR, "%s: socket(%s, ...): %m", __PRETTY_FUNCTION__, "AF_INET6");
+	assumes((s = socket(AF_INET, SOCK_DGRAM, 0)) != -1);
+	assumes((s6 = socket(AF_INET6, SOCK_DGRAM, 0)) != -1);
 
 	if (ioctl(s, SIOCGIFFLAGS, &ifr) == -1) {
 		syslog(LOG_ERR, "ioctl(SIOCGIFFLAGS): %m");
 	} else {
 		ifr.ifr_flags |= IFF_UP;
 
-		if (ioctl(s, SIOCSIFFLAGS, &ifr) == -1)
-			syslog(LOG_ERR, "ioctl(SIOCSIFFLAGS): %m");
+		assumes(ioctl(s, SIOCSIFFLAGS, &ifr) != -1);
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
@@ -2138,8 +1960,7 @@ static void loopback_setup(void)
 	} else {
 		ifr.ifr_flags |= IFF_UP;
 
-		if (ioctl(s6, SIOCSIFFLAGS, &ifr) == -1)
-			syslog(LOG_ERR, "ioctl(SIOCSIFFLAGS): %m");
+		assumes(ioctl(s6, SIOCSIFFLAGS, &ifr) != -1);
 	}
 
 	memset(&ifra, 0, sizeof(ifra));
@@ -2152,8 +1973,7 @@ static void loopback_setup(void)
 	((struct sockaddr_in *)&ifra.ifra_mask)->sin_addr.s_addr = htonl(IN_CLASSA_NET);
 	((struct sockaddr_in *)&ifra.ifra_mask)->sin_len = sizeof(struct sockaddr_in);
 
-	if (ioctl(s, SIOCAIFADDR, &ifra) == -1)
-		syslog(LOG_ERR, "ioctl(SIOCAIFADDR ipv4): %m");
+	assumes(ioctl(s, SIOCAIFADDR, &ifra) != -1);
 
 	memset(&ifra6, 0, sizeof(ifra6));
 	strcpy(ifra6.ifra_name, "lo0");
@@ -2167,11 +1987,10 @@ static void loopback_setup(void)
 	ifra6.ifra_lifetime.ia6t_vltime = ND6_INFINITE_LIFETIME;
 	ifra6.ifra_lifetime.ia6t_pltime = ND6_INFINITE_LIFETIME;
 
-	if (ioctl(s6, SIOCAIFADDR_IN6, &ifra6) == -1)
-		syslog(LOG_ERR, "ioctl(SIOCAIFADDR ipv6): %m");
+	assumes(ioctl(s6, SIOCAIFADDR_IN6, &ifra6) != -1);
  
-	close(s);
-	close(s6);
+	assumes(close(s) != -1);
+	assumes(close(s6) != -1);
 }
 
 static void workaround3048875(int argc, char *argv[])
@@ -2208,8 +2027,7 @@ static launch_data_t adjust_rlimits(launch_data_t in)
 	if (l == NULL) {
 		l = malloc(lsz);
 		for (i = 0; i < RLIM_NLIMITS; i++) {
-			if (getrlimit(i, l + i) == -1)
-				syslog(LOG_WARNING, "getrlimit(): %m");
+			assumes(getrlimit(i, l + i) != -1);
 		}
 	}
 
@@ -2248,16 +2066,12 @@ static launch_data_t adjust_rlimits(launch_data_t in)
 				default:
 					break;
 				}
-				if (sysctl(gmib, 2, NULL, NULL, &gval, sizeof(gval)) == -1)
-					syslog(LOG_WARNING, "sysctl(\"%s\"): %m", gstr);
-				if (sysctl(pmib, 2, NULL, NULL, &pval, sizeof(pval)) == -1)
-					syslog(LOG_WARNING, "sysctl(\"%s\"): %m", pstr);
+				assumes(sysctl(gmib, 2, NULL, NULL, &gval, sizeof(gval)) != -1);
+				assumes(sysctl(pmib, 2, NULL, NULL, &pval, sizeof(pval)) != -1);
 			}
-			if (setrlimit(i, ltmp + i) == -1)
-				syslog(LOG_WARNING, "setrlimit(): %m");
+			assumes(setrlimit(i, ltmp + i) != -1);
 			/* the kernel may have clamped the values we gave it */
-			if (getrlimit(i, l + i) == -1)
-				syslog(LOG_WARNING, "getrlimit(): %m");
+			assumes(getrlimit(i, l + i) != -1);
 		}
 	}
 
@@ -2410,13 +2224,13 @@ static void testfd_or_openfd(int fd, const char *path, int flags)
 	int tmpfd;
 
 	if (-1 != (tmpfd = dup(fd))) {
-		close(tmpfd);
+		assumes(close(tmpfd) != -1);
 	} else {
 		if (-1 == (tmpfd = open(path, flags))) {
 			syslog(LOG_ERR, "open(\"%s\", ...): %m", path);
 		} else if (tmpfd != fd) {
-			dup2(tmpfd, fd);
-			close(tmpfd);
+			assumes(dup2(tmpfd, fd) != -1);
+			assumes(close(tmpfd) != -1);
 		}
 	}
 }
@@ -2583,4 +2397,19 @@ cronemu_min(struct tm *wtm, int min)
 	}
 
 	return true;
+}
+
+void
+_log_launchd_bug(const char *path, unsigned int line, const char *test)
+{
+	int saved_errno = errno;
+	const char *file = strrchr(path, '/');
+
+	if (!file) {
+		file = path;
+	} else {
+		file += 1;
+	}
+
+	syslog(LOG_NOTICE, "Bug: %s:%u:%u: %s", file, line, saved_errno, test);
 }

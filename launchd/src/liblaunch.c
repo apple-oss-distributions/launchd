@@ -28,9 +28,11 @@
 #include <sys/uio.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <math.h>
 #include <errno.h>
 
 #include "launch.h"
@@ -89,6 +91,7 @@ extern void __OSBogusByteSwap__(void);
 
 struct launch_msg_header {
 	uint64_t magic;
+	uint64_t fdcnt;
 	uint64_t len;
 };
 
@@ -135,6 +138,18 @@ static int _fd(int fd);
 
 static pthread_once_t _lc_once = PTHREAD_ONCE_INIT;
 
+void (*__log_liblaunch_bug)(const char *path, unsigned int line, const char *test) = NULL;
+
+static void
+_log_liblaunch_bug(const char *path, unsigned int line, const char *test)
+{
+	if (__log_liblaunch_bug)
+		__log_liblaunch_bug(path, line, test);
+}
+
+#define assumes(e)      \
+        (__builtin_expect(!(e), 0) ? _log_liblaunch_bug(__FILE__, __LINE__, #e), false : true)
+
 static struct _launch_client {
 	pthread_mutex_t mtx;
 	launch_t	l;
@@ -158,7 +173,7 @@ static void launch_client_init(void)
 	if (_launchd_fd) {
 		lfd = strtol(_launchd_fd, NULL, 10);
 		if ((dfd = dup(lfd)) >= 0) {
-			close(dfd);
+			assumes(close(dfd) != -1);
 			_fd(lfd);
 		} else {
 			lfd = -1;
@@ -174,7 +189,7 @@ static void launch_client_init(void)
 		else
 			snprintf(sun.sun_path, sizeof(sun.sun_path), "%s/%u/sock", LAUNCHD_SOCK_PREFIX, getuid());
 
-		if ((lfd = _fd(socket(AF_UNIX, SOCK_STREAM, 0))) == -1)
+		if (!assumes((lfd = _fd(socket(AF_UNIX, SOCK_STREAM, 0))) != -1))
 			goto out_bad;
 
 		for (tries = 0; tries < 10; tries++) {
@@ -188,7 +203,7 @@ static void launch_client_init(void)
 			}
 		}
 		if (r == -1) {
-			close(lfd);
+			assumes(close(lfd) != -1);
 			goto out_bad;
 		}
 	}
@@ -259,26 +274,36 @@ void launch_data_free(launch_data_t d)
 
 size_t launch_data_dict_get_count(launch_data_t dict)
 {
+	if (!assumes(dict->type == LAUNCH_DATA_DICTIONARY))
+		return 0;
+
 	return dict->_array_cnt / 2;
 }
 
 
 bool launch_data_dict_insert(launch_data_t dict, launch_data_t what, const char *key)
 {
+	launch_data_t thekey;
 	size_t i;
-	launch_data_t thekey = launch_data_alloc(LAUNCH_DATA_STRING);
 
-	launch_data_set_string(thekey, key);
+	if (!assumes(dict->type == LAUNCH_DATA_DICTIONARY))
+		return false;
+
+	thekey = launch_data_new_string(key);
 
 	for (i = 0; i < dict->_array_cnt; i += 2) {
 		if (!strcasecmp(key, dict->_array[i]->string)) {
+			dict->type = LAUNCH_DATA_ARRAY;
 			launch_data_array_set_index(dict, thekey, i);
 			launch_data_array_set_index(dict, what, i + 1);
+			dict->type = LAUNCH_DATA_DICTIONARY;
 			return true;
 		}
 	}
+	dict->type = LAUNCH_DATA_ARRAY;
 	launch_data_array_set_index(dict, thekey, i);
 	launch_data_array_set_index(dict, what, i + 1);
+	dict->type = LAUNCH_DATA_DICTIONARY;
 	return true;
 }
 
@@ -286,7 +311,7 @@ launch_data_t launch_data_dict_lookup(launch_data_t dict, const char *key)
 {
 	size_t i;
 
-	if (LAUNCH_DATA_DICTIONARY != dict->type)
+	if (!assumes(dict->type == LAUNCH_DATA_DICTIONARY))
 		return NULL;
 
 	for (i = 0; i < dict->_array_cnt; i += 2) {
@@ -300,6 +325,9 @@ launch_data_t launch_data_dict_lookup(launch_data_t dict, const char *key)
 bool launch_data_dict_remove(launch_data_t dict, const char *key)
 {
 	size_t i;
+
+	if (!assumes(dict->type == LAUNCH_DATA_DICTIONARY))
+		return false;
 
 	for (i = 0; i < dict->_array_cnt; i += 2) {
 		if (!strcasecmp(key, dict->_array[i]->string))
@@ -318,7 +346,7 @@ void launch_data_dict_iterate(launch_data_t dict, void (*cb)(launch_data_t, cons
 {
 	size_t i;
 
-	if (LAUNCH_DATA_DICTIONARY != dict->type)
+	if (!assumes(dict->type == LAUNCH_DATA_DICTIONARY))
 		return;
 
 	for (i = 0; i < dict->_array_cnt; i += 2)
@@ -327,6 +355,9 @@ void launch_data_dict_iterate(launch_data_t dict, void (*cb)(launch_data_t, cons
 
 bool launch_data_array_set_index(launch_data_t where, launch_data_t what, size_t ind)
 {
+	if (!assumes(where->type == LAUNCH_DATA_ARRAY))
+		return false;
+
 	if ((ind + 1) >= where->_array_cnt) {
 		where->_array = realloc(where->_array, (ind + 1) * sizeof(launch_data_t));
 		memset(where->_array + where->_array_cnt, 0, (ind + 1 - where->_array_cnt) * sizeof(launch_data_t));
@@ -341,8 +372,9 @@ bool launch_data_array_set_index(launch_data_t where, launch_data_t what, size_t
 
 launch_data_t launch_data_array_get_index(launch_data_t where, size_t ind)
 {
-	if (LAUNCH_DATA_ARRAY != where->type)
+	if (!assumes(where->type == LAUNCH_DATA_ARRAY))
 		return NULL;
+
 	if (ind < where->_array_cnt)
 		return where->_array[ind];
 	return NULL;
@@ -351,6 +383,9 @@ launch_data_t launch_data_array_get_index(launch_data_t where, size_t ind)
 launch_data_t launch_data_array_pop_first(launch_data_t where)
 {
 	launch_data_t r = NULL;
+
+	if (!assumes(where->type == LAUNCH_DATA_ARRAY))
+		return NULL;
        
 	if (where->_array_cnt > 0) {
 		r = where->_array[0];
@@ -362,43 +397,55 @@ launch_data_t launch_data_array_pop_first(launch_data_t where)
 
 size_t launch_data_array_get_count(launch_data_t where)
 {
-	if (LAUNCH_DATA_ARRAY != where->type)
+	if (!assumes(where->type == LAUNCH_DATA_ARRAY))
 		return 0;
 	return where->_array_cnt;
 }
 
 bool launch_data_set_errno(launch_data_t d, int e)
 {
+	if (!assumes(d->type == LAUNCH_DATA_ERRNO))
+		return false;
 	d->err = e;
 	return true;
 }
 
 bool launch_data_set_fd(launch_data_t d, int fd)
 {
+	if (!assumes(d->type == LAUNCH_DATA_FD))
+		return false;
 	d->fd = fd;
 	return true;
 }
 
 bool launch_data_set_integer(launch_data_t d, long long n)
 {
+	if (!assumes(d->type == LAUNCH_DATA_INTEGER))
+		return false;
 	d->number = n;
 	return true;
 }
 
 bool launch_data_set_bool(launch_data_t d, bool b)
 {
+	if (!assumes(d->type == LAUNCH_DATA_BOOL))
+		return false;
 	d->boolean = b;
 	return true;
 }
 
 bool launch_data_set_real(launch_data_t d, double n)
 {
+	if (!assumes(d->type == LAUNCH_DATA_REAL))
+		return false;
 	d->float_num = n;
 	return true;
 }
 
 bool launch_data_set_string(launch_data_t d, const char *s)
 {
+	if (!assumes(d->type == LAUNCH_DATA_STRING))
+		return false;
 	if (d->string)
 		free(d->string);
 	d->string = strdup(s);
@@ -411,6 +458,8 @@ bool launch_data_set_string(launch_data_t d, const char *s)
 
 bool launch_data_set_opaque(launch_data_t d, const void *o, size_t os)
 {
+	if (!assumes(d->type == LAUNCH_DATA_OPAQUE))
+		return false;
 	d->opaque_size = os;
 	if (d->opaque)
 		free(d->opaque);
@@ -424,45 +473,57 @@ bool launch_data_set_opaque(launch_data_t d, const void *o, size_t os)
 
 int launch_data_get_errno(launch_data_t d)
 {
+	if (!assumes(d->type == LAUNCH_DATA_ERRNO))
+		return 0;
 	return d->err;
 }
 
 int launch_data_get_fd(launch_data_t d)
 {
+	if (!assumes(d->type == LAUNCH_DATA_FD))
+		return -1;
 	return d->fd;
 }
 
 long long launch_data_get_integer(launch_data_t d)
 {
+	if (!assumes(d->type == LAUNCH_DATA_INTEGER))
+		return 0;
 	return d->number;
 }
 
 bool launch_data_get_bool(launch_data_t d)
 {
+	if (!assumes(d->type == LAUNCH_DATA_BOOL))
+		return false;
 	return d->boolean;
 }
 
 double launch_data_get_real(launch_data_t d)
 {
+	if (!assumes(d->type == LAUNCH_DATA_REAL))
+		return NAN;
 	return d->float_num;
 }
 
 const char *launch_data_get_string(launch_data_t d)
 {
-	if (LAUNCH_DATA_STRING != d->type)
+	if (!assumes(d->type == LAUNCH_DATA_STRING))
 		return NULL;
 	return d->string;
 }
 
 void *launch_data_get_opaque(launch_data_t d)
 {
-	if (LAUNCH_DATA_OPAQUE != d->type)
+	if (!assumes(d->type == LAUNCH_DATA_OPAQUE))
 		return NULL;
 	return d->opaque;
 }
 
 size_t launch_data_get_opaque_size(launch_data_t d)
 {
+	if (!assumes(d->type == LAUNCH_DATA_OPAQUE))
+		return 0;
 	return d->opaque_size;
 }
 
@@ -481,7 +542,7 @@ launch_t launchd_fdopen(int fd)
 
         c->fd = fd;
 
-	fcntl(fd, F_SETFL, O_NONBLOCK);
+	assumes(fcntl(fd, F_SETFL, O_NONBLOCK) != -1);
 
         if ((c->sendbuf = malloc(0)) == NULL)
 		goto out_bad;
@@ -517,7 +578,7 @@ void launchd_close(launch_t lh)
 		free(lh->recvbuf);
 	if (lh->recvfds)
 		free(lh->recvfds);
-	close(lh->fd);
+	assumes(close(lh->fd) != -1);
 	free(lh);
 }
 
@@ -675,6 +736,7 @@ int launchd_msg_send(launch_t lh, launch_data_t d)
 
 		msglen = (lh->sendlen - msglen) + sizeof(struct launch_msg_header);
 		lmh.len = host2big(msglen);
+		lmh.fdcnt = 0;
 		lmh.magic = host2big(LAUNCH_MSG_HEADER_MAGIC);
 
 		iov[0].iov_base = &lmh;
@@ -691,6 +753,7 @@ int launchd_msg_send(launch_t lh, launch_data_t d)
 
 
 	if (lh->sendfdcnt > 0) {
+		lmh.fdcnt = host2big((uint64_t)lh->sendfdcnt);
 		sentctrllen = mh.msg_controllen = CMSG_SPACE(lh->sendfdcnt * sizeof(int));
 		cm = alloca(mh.msg_controllen);
 		mh.msg_control = cm;
@@ -702,9 +765,10 @@ int launchd_msg_send(launch_t lh, launch_data_t d)
 		cm->cmsg_type = SCM_RIGHTS;
 
 		memcpy(CMSG_DATA(cm), lh->sendfds, lh->sendfdcnt * sizeof(int));
+
 	}
 
-	if ((r = sendmsg(lh->fd, &mh, 0)) == -1) {
+	if (!assumes((r = sendmsg(lh->fd, &mh, 0)) != -1)) {
 		return -1;
 	} else if (r == 0) {
 		errno = ECONNRESET;
@@ -777,7 +841,7 @@ launch_data_t launch_msg(launch_data_t d)
 
 	if (d && launchd_msg_send(_lc->l, d) == -1) {
 		do {
-			if (errno != EAGAIN)
+			if (!assumes(errno == EAGAIN))
 				goto out;
 		} while (launchd_msg_send(_lc->l, NULL) == -1);
 	}
@@ -788,7 +852,7 @@ launch_data_t launch_msg(launch_data_t d)
 			goto out;
 		}
 		if (launchd_msg_recv(_lc->l, launch_msg_getmsgs, &resp) == -1) {
-			if (errno != EAGAIN) {
+			if (!assumes(errno == EAGAIN)) {
 				goto out;
 			} else if (d == NULL) {
 				errno = 0;
@@ -799,7 +863,7 @@ launch_data_t launch_msg(launch_data_t d)
 				FD_ZERO(&rfds);
 				FD_SET(_lc->l->fd, &rfds);
 			
-				select(_lc->l->fd + 1, &rfds, NULL, NULL, NULL);
+				assumes(select(_lc->l->fd + 1, &rfds, NULL, NULL, NULL) == 1);
 			}
 		}
 	}
@@ -830,18 +894,22 @@ int launchd_msg_recv(launch_t lh, void (*cb)(launch_data_t, void *), void *conte
 	mh.msg_control = cm;
 	mh.msg_controllen = 4096;
 
-	if ((r = recvmsg(lh->fd, &mh, 0)) == -1)
+	if (!assumes((r = recvmsg(lh->fd, &mh, 0)) != -1))
 		return -1;
 	if (r == 0) {
 		errno = ECONNRESET;
 		return -1;
 	}
-	if (mh.msg_flags & MSG_CTRUNC) {
+	if (!assumes(!(mh.msg_flags & MSG_CTRUNC))) {
 		errno = ECONNABORTED;
 		return -1;
 	}
 	lh->recvlen += r;
 	if (mh.msg_controllen > 0) {
+		if (!assumes(cm->cmsg_len == mh.msg_controllen)) {
+			errno = ESPIPE;
+			return -1;
+		}
 		lh->recvfds = realloc(lh->recvfds, lh->recvfdcnt * sizeof(int) + mh.msg_controllen - sizeof(struct cmsghdr));
 		memcpy(lh->recvfds + lh->recvfdcnt, CMSG_DATA(cm), mh.msg_controllen - sizeof(struct cmsghdr));
 		lh->recvfdcnt += (mh.msg_controllen - sizeof(struct cmsghdr)) / sizeof(int);
@@ -860,9 +928,15 @@ int launchd_msg_recv(launch_t lh, void (*cb)(launch_data_t, void *), void *conte
 
 		tmplen = big2host(lmhp->len);
 
-		if (big2host(lmhp->magic) != LAUNCH_MSG_HEADER_MAGIC || tmplen <= sizeof(struct launch_msg_header)) {
+		if (!assumes(big2host(lmhp->magic) == LAUNCH_MSG_HEADER_MAGIC) ||
+				!assumes(tmplen > sizeof(struct launch_msg_header))) {
 			errno = EBADRPC;
 			goto out_bad;
+		}
+
+		if (!assumes(big2host(lmhp->fdcnt) == lh->recvfdcnt)) {
+			errno = ERANGE;
+			return -1;
 		}
 
 		if (lh->recvlen < tmplen) {
@@ -891,6 +965,9 @@ int launchd_msg_recv(launch_t lh, void (*cb)(launch_data_t, void *), void *conte
 			free(lh->recvfds);
 			lh->recvfds = malloc(0);
 		}
+
+		if (lh->recvlen == 0)
+			assumes(lh->recvfdcnt == 0);
 	}
 
 	return r;
@@ -972,7 +1049,7 @@ bool launchd_batch_query(void)
 static int _fd(int fd)
 {
 	if (fd >= 0)
-		fcntl(fd, F_SETFD, 1);
+		assumes(fcntl(fd, F_SETFD, 1) != -1);
 	return fd;
 }
 

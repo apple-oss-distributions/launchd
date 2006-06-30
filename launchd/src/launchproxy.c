@@ -40,6 +40,7 @@
 #include <getopt.h>
 #include <signal.h>
 #include <netdb.h>
+#include <assert.h>
 
 #include "launch.h"
 
@@ -60,10 +61,9 @@ static void find_fds(launch_data_t o, const char *key __attribute__((unused)), v
 		fd = launch_data_get_fd(o);
 		if (-1 == fd)
 			break;
-		fcntl(fd, F_SETFD, 1);
+		assert(fcntl(fd, F_SETFD, 1) != -1);
 		EV_SET(&kev, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-		if (kevent(kq, &kev, 1, NULL, 0, NULL) == -1)
-			syslog(LOG_DEBUG, "kevent(%d): %m", fd);
+		assert(kevent(kq, &kev, 1, NULL, 0, NULL) != -1);
                 break;
         case LAUNCH_DATA_ARRAY:
                 for (i = 0; i < launch_data_array_get_count(o); i++)
@@ -79,7 +79,7 @@ static void find_fds(launch_data_t o, const char *key __attribute__((unused)), v
 
 int main(int argc __attribute__((unused)), char *argv[])
 {
-	struct timespec timeout = { 10, 0 };
+	struct timespec timeout = { 120, 0 };
 	struct sockaddr_storage ss;
 	socklen_t slen = sizeof(ss);
 	struct kevent kev;
@@ -143,11 +143,11 @@ int main(int argc __attribute__((unused)), char *argv[])
 		}
 
 		if (w) {
-			dup2(kev.ident, STDIN_FILENO);
+			assert(dup2(kev.ident, STDIN_FILENO) != -1);
 			if (dupstdout)
-				dup2(kev.ident, STDOUT_FILENO);
+				assert(dup2(kev.ident, STDOUT_FILENO) != -1);
 			if (dupstderr)
-				dup2(kev.ident, STDERR_FILENO);
+				assert(dup2(kev.ident, STDERR_FILENO) != -1);
 			execv(prog, argv + 1);
 			syslog(LOG_ERR, "execv(): %m");
 			exit(EXIT_FAILURE);
@@ -194,16 +194,17 @@ int main(int argc __attribute__((unused)), char *argv[])
 					syslog(LOG_NOTICE, "%s: SessionCreate == NULL!", prog);
 				}
 			}
-			fcntl(r, F_SETFL, 0);
-			dup2(r, STDIN_FILENO);
+			assert(fcntl(r, F_SETFL, 0) != -1);
+			assert(dup2(r, STDIN_FILENO) != -1);
 			if (dupstdout)
-				dup2(r, STDOUT_FILENO);
+				assert(dup2(r, STDOUT_FILENO) != -1);
 			if (dupstderr)
-				dup2(r, STDERR_FILENO);
+				assert(dup2(r, STDERR_FILENO) != -1);
+			assert(close(r) != -1);
 			signal(SIGCHLD, SIG_DFL);
 			execv(prog, argv + 1);
 			syslog(LOG_ERR, "execv(): %m");
-			exit(EXIT_FAILURE);
+			_exit(EXIT_FAILURE);
 		}
 	}
 

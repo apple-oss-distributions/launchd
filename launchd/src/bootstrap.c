@@ -548,7 +548,7 @@ start_server(server_t *serverp)
 			syslog(LOG_WARNING, "fork(): %m");
 		} else if (pid == 0) {	/* CHILD */
 			exec_server(serverp);
-			exit(EXIT_FAILURE);
+			_exit(EXIT_FAILURE);
 		} else {		/* PARENT */
 			syslog(LOG_INFO, "Launched server %x in bootstrap %x uid %d: \"%s\": [pid %d]",
 			     serverp->port, serverp->bootstrap->bootstrap_port,
@@ -999,6 +999,20 @@ server_demux(
 #define	bootstrapMaxRequestSize	1024
 #define	bootstrapMaxReplySize	1024
 
+static boolean_t
+server_demux_with_giant_lock(
+	mach_msg_header_t *Request,
+	mach_msg_header_t *Reply)
+{
+	boolean_t r;
+
+	assumes(pthread_mutex_lock(&giant_lock) == 0);
+	r = server_demux(Request, Reply);
+	assumes(pthread_mutex_unlock(&giant_lock) == 0);
+
+	return r;
+}
+
 void *
 mach_server_loop(void *arg __attribute__((unused)))
 {
@@ -1006,7 +1020,7 @@ mach_server_loop(void *arg __attribute__((unused)))
 
 	for (;;) {
 		mresult = mach_msg_server(
-						server_demux,
+						server_demux_with_giant_lock,
 						bootstrapMaxRequestSize,
 						bootstrap_port_set,
                         MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_SENDER)|

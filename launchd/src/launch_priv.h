@@ -50,6 +50,8 @@
 
 typedef struct _launch *launch_t;
 
+extern void (*__log_liblaunch_bug)(const char *path, unsigned int line, const char *test);
+
 launch_t launchd_fdopen(int);
 int launchd_getfd(launch_t);
 void launchd_close(launch_t);

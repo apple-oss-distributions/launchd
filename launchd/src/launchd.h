@@ -25,11 +25,17 @@
 
 #include <sys/event.h>
 
+#define assumes(e)	\
+	(__builtin_expect(!(e), 0) ? _log_launchd_bug(__FILE__, __LINE__, #e), false : true)
+
+void _log_launchd_bug(const char *path, unsigned int line, const char *test);
+
 typedef void (*kq_callback)(void *, struct kevent *);
 
 extern kq_callback kqsimple_zombie_reaper;
 extern mach_port_t launchd_bootstrap_port;
 extern sigset_t blocked_signals;
+extern pthread_mutex_t giant_lock;
 
 #ifdef PID1_REAP_ADOPTED_CHILDREN
 extern int pid1_child_exit_status;

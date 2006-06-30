@@ -742,6 +742,9 @@ workaround_bonjour_asynchronously(void)
 	DNSServiceRef service;
 	int fd;
 
+	if (SLIST_EMPTY(&bm_later))
+		return;
+
 	if (fork() != 0)
 		return;
 	
@@ -774,12 +777,14 @@ workaround_bonjour_asynchronously(void)
 
 	launch_data_free(msg);
 
-	if (launch_data_get_type(resp) == LAUNCH_DATA_ERRNO) {
-		errno = launch_data_get_errno(resp);
-		fprintf(stderr, "Workaround Bonjour: %s\n", strerror(errno));
+	if (resp) {
+		if (launch_data_get_type(resp) == LAUNCH_DATA_ERRNO) {
+			if ((errno = launch_data_get_errno(resp))) {
+				fprintf(stderr, "Workaround Bonjour: %s\n", strerror(errno));
+			}
+		}
+		launch_data_free(resp);
 	}
-
-	launch_data_free(resp);
 
 	_exit(EXIT_SUCCESS);
 }
@@ -839,11 +844,9 @@ static launch_data_t CF2launch_data(CFTypeRef cfr)
 	if (cft == CFStringGetTypeID()) {
 		char buf[4096];
 		CFStringGetCString(cfr, buf, sizeof(buf), kCFStringEncodingUTF8);
-		r = launch_data_alloc(LAUNCH_DATA_STRING);
-		launch_data_set_string(r, buf);
+		r = launch_data_new_string(buf);
 	} else if (cft == CFBooleanGetTypeID()) {
-		r = launch_data_alloc(LAUNCH_DATA_BOOL);
-		launch_data_set_bool(r, CFBooleanGetValue(cfr));
+		r = launch_data_new_bool(CFBooleanGetValue(cfr));
 	} else if (cft == CFArrayGetTypeID()) {
 		CFIndex i, ac = CFArrayGetCount(cfr);
 		r = launch_data_alloc(LAUNCH_DATA_ARRAY);
@@ -858,8 +861,7 @@ static launch_data_t CF2launch_data(CFTypeRef cfr)
 		r = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
 		CFDictionaryApplyFunction(cfr, myCFDictionaryApplyFunction, r);
 	} else if (cft == CFDataGetTypeID()) {
-		r = launch_data_alloc(LAUNCH_DATA_ARRAY);
-		launch_data_set_opaque(r, CFDataGetBytePtr(cfr), CFDataGetLength(cfr));
+		r = launch_data_new_opaque(CFDataGetBytePtr(cfr), CFDataGetLength(cfr));
 	} else if (cft == CFNumberGetTypeID()) {
 		long long n;
 		double d;
@@ -875,16 +877,14 @@ static launch_data_t CF2launch_data(CFTypeRef cfr)
 		case kCFNumberLongType:
 		case kCFNumberLongLongType:
 			CFNumberGetValue(cfr, kCFNumberLongLongType, &n);
-			r = launch_data_alloc(LAUNCH_DATA_INTEGER);
-			launch_data_set_integer(r, n);
+			r = launch_data_new_integer(n);
 			break;
 		case kCFNumberFloat32Type:
 		case kCFNumberFloat64Type:
 		case kCFNumberFloatType:
 		case kCFNumberDoubleType:
 			CFNumberGetValue(cfr, kCFNumberDoubleType, &d);
-			r = launch_data_alloc(LAUNCH_DATA_REAL);
-			launch_data_set_real(r, d);
+			r = launch_data_new_real(d);
 			break;
 		default:
 			r = NULL;
