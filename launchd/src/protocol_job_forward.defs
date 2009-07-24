@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_APACHE_LICENSE_HEADER_START@
  * 
@@ -18,13 +18,36 @@
  * @APPLE_APACHE_LICENSE_HEADER_END@
  */
 
-subsystem launchd_internal 137000;
+subsystem job_forward 400;
 
 #include <mach/std_types.defs>
 #include <mach/mach_types.defs>
+#include "launchd_mig_types.defs"
+import "vproc.h";
+import "vproc_priv.h";
+import "vproc_internal.h";
 
-serverprefix x_;
+userprefix vproc_mig_;
+serverprefix job_mig_;
 
-routine handle_kqueue(
-						__port	: mach_port_t;
-						__fd	: integer_t);
+skip; /* create_server */
+
+skip; /* reboot2 */
+
+skip; /* check_in */
+
+skip; /* register2 */
+
+simpleroutine look_up2_forward(
+				__bs_port				: job_t;
+replyport		__rport					: mach_port_move_send_once_t;
+				__service_name			: name_t;
+				__target_pid			: pid_t;
+				__flags					: uint64_t);
+
+skip; /* send_signal */
+
+simpleroutine parent_forward(
+                __bs_port				: job_t;
+replyport		__rport					: mach_port_move_send_once_t);
+

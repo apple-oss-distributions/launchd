@@ -18,27 +18,27 @@
  * @APPLE_APACHE_LICENSE_HEADER_END@
  */
 
-#define _NONSTD_SOURCE 1
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <signal.h>
 
 #include "launchd_runtime_kill.h"
 
-/*
- * POSIX defines consistency over correctness, and consequently kill/killpg now
- * returns EPERM instead of ESRCH.
- *
- * I've filed 5487498 to get a non-portable kill() variant, but for now,
- * defining _NONSTD_SOURCE gets us the old behavior.
- */
-
 int
 runtime_kill(pid_t pid, int sig)
 {
-	return kill(pid, sig);
+	/*
+	 * POSIX defines consistency over correctness, and consequently
+	 * kill/killpg now returns EPERM instead of ESRCH.
+	 *
+	 * I've filed 5487498 to get a non-portable kill().
+	 * We'll regretfully take advantage of implementation details for now.
+	 */
+	return syscall(SYS_kill, pid, sig, 0);
 }
 
 int
 runtime_killpg(pid_t pgrp, int sig)
 {
-	return killpg(pgrp, sig);
+	return runtime_kill(-pgrp, sig);
 }

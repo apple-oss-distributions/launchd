@@ -24,7 +24,7 @@
 
 #include "launchd_runtime.h"
 #include "launchd_core_logic.h"
-#include "liblaunch_private.h"
+#include "launch_priv.h"
 
 struct conncb {
 	kq_callback kqconn_callback;
@@ -39,10 +39,8 @@ void ipc_open(int fd, job_t j);
 void ipc_close_all_with_job(job_t j);
 void ipc_close(struct conncb *c);
 void ipc_callback(void *, struct kevent *);
-void ipc_readmsg(launch_data_t msg, void *context);
 void ipc_revoke_fds(launch_data_t o);
 void ipc_close_fds(launch_data_t o);
-void ipc_clean_up(void);
 void ipc_server_init(void);
 
 #endif
